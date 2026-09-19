@@ -1,0 +1,14 @@
+{
+  "appId": "com.muktimandiri.timesheet",
+  "appName": "TimeSheet Karyawan",
+  "webDir": "dist",
+  "backgroundColor": "#000000",
+  "server": {
+    "url": "https://timesheet.elivereport.com/mobile",
+    "cleartext": false
+  },
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#000000"
+  }
+}
