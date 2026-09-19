@@ -6,7 +6,7 @@ Aplikasi Android untuk Clock In / Clock Out. WebView memuat `https://timesheet.e
 - `appId`: `com.muktimandiri.timesheet`
 - Plugin native custom `TsDevice` (`android/app/src/main/java/com/muktimandiri/timesheet/TsDevicePlugin.java`):
   lokasi + flag mock location (Fake GPS) dan deteksi aplikasi Fake GPS terpasang.
-- `@capacitor/local-notifications`: pengingat Clock Out tiap jam setelah 18:00.
+- `@capacitor/push-notifications` (FCM): pengingat Clock Out 18:00-22:00 dikirim server. Butuh `android/app/google-services.json` (Firebase project `tracking-mukti`, app `com.muktimandiri.timesheet`) - berkas ini TIDAK masuk git.
 - Izin: Kamera, Lokasi, Notifikasi, Internet.
 
 ## Build
