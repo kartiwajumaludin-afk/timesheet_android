@@ -1,6 +1,11 @@
 package com.muktimandiri.timesheet;
 
 import android.Manifest;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.content.Intent;
+import android.net.Uri;
+import android.provider.Settings;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -11,6 +16,8 @@ import android.os.CancellationSignal;
 import android.os.Handler;
 import android.os.Looper;
 
+import androidx.core.app.ActivityCompat;
+import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.ContextCompat;
 import androidx.core.location.LocationManagerCompat;
 
@@ -43,7 +50,9 @@ import java.util.Set;
         @Permission(alias = "location", strings = {
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION
-        })
+        }),
+        @Permission(alias = "camera", strings = { Manifest.permission.CAMERA }),
+        @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS })
     }
 )
 public class TsDevicePlugin extends Plugin {
@@ -182,6 +191,150 @@ public class TsDevicePlugin extends Plugin {
         r.put("provider", loc.getProvider());
         r.put("isMock", mock);
         call.resolve(r);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // SETUP IZIN (Kamera, Lokasi, Notifikasi) - dipakai layar "Setup Aplikasi"
+    //
+    // Semua memakai intent standar Android, jadi berlaku di SEMUA merek HP
+    // (Xiaomi, Oppo, Vivo, Samsung, dst): dialog izin sistem, dan kalau sudah
+    // "ditolak permanen" -> langsung buka halaman setelannya.
+    // ══════════════════════════════════════════════════════════════
+
+    private static final String CHANNEL_ID = "clockout";
+
+    private boolean granted(String permission) {
+        return ContextCompat.checkSelfPermission(getContext(), permission) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean notificationsEnabled() {
+        return NotificationManagerCompat.from(getContext()).areNotificationsEnabled();
+    }
+
+    /** Status semua izin sekaligus. channel: "ok" | "off" (dimatikan user) | "none" (belum dibuat). */
+    @PluginMethod
+    public void checkAll(PluginCall call) {
+        JSObject r = new JSObject();
+        r.put("camera", granted(Manifest.permission.CAMERA));
+        r.put("location", granted(Manifest.permission.ACCESS_FINE_LOCATION) || granted(Manifest.permission.ACCESS_COARSE_LOCATION));
+        r.put("notifications", notificationsEnabled());
+
+        String channel = "none";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager nm = (NotificationManager) getContext().getSystemService(android.content.Context.NOTIFICATION_SERVICE);
+            NotificationChannel ch = nm != null ? nm.getNotificationChannel(CHANNEL_ID) : null;
+            if (ch != null) channel = ch.getImportance() == NotificationManager.IMPORTANCE_NONE ? "off" : "ok";
+        } else {
+            channel = "ok";
+        }
+        r.put("channel", channel);
+        call.resolve(r);
+    }
+
+    private void finishRequest(PluginCall call, boolean granted, String permission) {
+        JSObject r = new JSObject();
+        r.put("granted", granted);
+        // Diblokir = ditolak DAN sistem tidak akan menampilkan dialog lagi ("jangan tanya lagi").
+        boolean blocked = !granted && (getActivity() == null
+            || !ActivityCompat.shouldShowRequestPermissionRationale(getActivity(), permission));
+        r.put("blocked", blocked);
+        call.resolve(r);
+    }
+
+    @PluginMethod
+    public void requestCamera(PluginCall call) {
+        if (granted(Manifest.permission.CAMERA)) { finishRequest(call, true, Manifest.permission.CAMERA); return; }
+        requestPermissionForAlias("camera", call, "cameraRequestCallback");
+    }
+
+    @PermissionCallback
+    private void cameraRequestCallback(PluginCall call) {
+        finishRequest(call, granted(Manifest.permission.CAMERA), Manifest.permission.CAMERA);
+    }
+
+    @PluginMethod
+    public void requestLocation(PluginCall call) {
+        if (granted(Manifest.permission.ACCESS_FINE_LOCATION)) { finishRequest(call, true, Manifest.permission.ACCESS_FINE_LOCATION); return; }
+        requestPermissionForAlias("location", call, "locationRequestCallback");
+    }
+
+    @PermissionCallback
+    private void locationRequestCallback(PluginCall call) {
+        boolean ok = granted(Manifest.permission.ACCESS_FINE_LOCATION) || granted(Manifest.permission.ACCESS_COARSE_LOCATION);
+        finishRequest(call, ok, Manifest.permission.ACCESS_FINE_LOCATION);
+    }
+
+    @PluginMethod
+    public void requestNotifications(PluginCall call) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            // Android 12 ke bawah: tidak ada izin runtime; yang ada hanya toggle notifikasi aplikasi.
+            JSObject r = new JSObject();
+            boolean on = notificationsEnabled();
+            r.put("granted", on);
+            r.put("blocked", !on);
+            call.resolve(r);
+            return;
+        }
+        if (granted(Manifest.permission.POST_NOTIFICATIONS)) {
+            // Izin ada, tapi toggle notifikasi aplikasi dimatikan user di Setelan -> harus dinyalakan manual.
+            JSObject r = new JSObject();
+            boolean on = notificationsEnabled();
+            r.put("granted", on);
+            r.put("blocked", !on);
+            call.resolve(r);
+            return;
+        }
+        requestPermissionForAlias("notifications", call, "notifRequestCallback");
+    }
+
+    @PermissionCallback
+    private void notifRequestCallback(PluginCall call) {
+        finishRequest(call, granted(Manifest.permission.POST_NOTIFICATIONS) && notificationsEnabled(), Manifest.permission.POST_NOTIFICATIONS);
+    }
+
+    private void startSettings(PluginCall call, Intent primary) {
+        try {
+            primary.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(primary);
+            call.resolve();
+        } catch (Exception e) {
+            try {
+                Intent fallback = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getContext().getPackageName()));
+                fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(fallback);
+                call.resolve();
+            } catch (Exception e2) {
+                call.reject("Gagal membuka Pengaturan: " + e2.getMessage());
+            }
+        }
+    }
+
+    /** Halaman "Info Aplikasi" (Kamera/Lokasi: Izin -> pilih izinnya -> Izinkan). */
+    @PluginMethod
+    public void openAppSettings(PluginCall call) {
+        startSettings(call, new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getContext().getPackageName())));
+    }
+
+    /**
+     * Halaman Setelan Notifikasi langsung: channel=true -> halaman channel "Pengingat Clock Out"
+     * (tinggal toggle ON); channel=false -> halaman notifikasi aplikasi (toggle utama).
+     */
+    @PluginMethod
+    public void openNotificationSettings(PluginCall call) {
+        boolean channel = Boolean.TRUE.equals(call.getBoolean("channel", false));
+        Intent i;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (channel) {
+                i = new Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS);
+                i.putExtra(Settings.EXTRA_CHANNEL_ID, CHANNEL_ID);
+            } else {
+                i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+            }
+            i.putExtra(Settings.EXTRA_APP_PACKAGE, getContext().getPackageName());
+        } else {
+            i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getContext().getPackageName()));
+        }
+        startSettings(call, i);
     }
 
     // ── Deteksi aplikasi Fake GPS terpasang ──────────────────────────
