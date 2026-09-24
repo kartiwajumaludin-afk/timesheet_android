@@ -59,6 +59,8 @@ public class TsDevicePlugin extends Plugin {
 
     private static final long GPS_TIMEOUT_MS = 15000;
     private static final long NET_TIMEOUT_MS = 8000;
+    /** Lokasi jaringan dengan akurasi sebaik ini (meter) langsung dipakai tanpa menunggu GPS. */
+    private static final float GOOD_ACCURACY_M = 50f;
 
     /** Paket aplikasi Fake GPS / mock location yang umum dipakai. */
     private static final Set<String> KNOWN_FAKE_GPS = new HashSet<>(Arrays.asList(
@@ -120,33 +122,84 @@ public class TsDevicePlugin extends Plugin {
         }
 
         try {
-            // GPS dulu (paling akurat); kalau tidak dapat dalam batas waktu -> jaringan; terakhir lokasi terakhir yang segar.
+            // v1.3 (2026-09-24, Mang: Clock In/Out terasa lama): GPS dan JARINGAN diminta BERSAMAAN
+            // (sebelumnya berurutan: GPS sampai 15 dtk, baru jaringan sampai 8 dtk = terburuk 23 dtk,
+            // dan di dalam gedung GPS sering tidak dapat sinyal). Aturan:
+            //  - GPS dapat lokasi -> langsung dipakai (paling akurat).
+            //  - Jaringan dapat lokasi dengan akurasi <= GOOD_ACCURACY_M -> langsung dipakai
+            //    (biasanya 1-3 dtk di dalam gedung). Akurasi lebih buruk = tidak dipakai dulu,
+            //    ditunggu GPS supaya karyawan yang sah tidak tertolak radius.
+            //  - Keduanya selesai tanpa hasil yang bagus -> jaringan (apa adanya), lalu lokasi terakhir yang segar.
+            // Semua callback jalan di main thread (getMainExecutor) -> array flag di bawah aman.
+            // Bendera isMock ikut dari lokasi yang dipakai, jadi pengecekan Fake GPS tidak berubah.
+            // Fake GPS yang SEDANG AKTIF memasok posisi palsu ke penyedia lokasi HP dan meninggalkan
+            // lokasi bertanda mock yang baru. Kalau ada, langsung dilaporkan (isMock=true -> diblokir HP &
+            // server) - jangan sampai hasil jaringan yang asli menutupinya di jalur cepat di bawah.
+            Location mock = recentMockLocation(lm);
+            if (mock != null) { resolve(call, mock); return; }
+
+            final boolean[] done = {false};
+            final boolean[] gpsDone = {!gps};
+            final boolean[] netDone = {!net};
+            final Location[] netLoc = {null};
+            final CancellationSignal[] gpsSig = {null};
+            final CancellationSignal[] netSig = {null};
+
+            final Runnable finishWithoutGood = () -> {
+                if (done[0] || !gpsDone[0] || !netDone[0]) return;
+                done[0] = true;
+                if (netLoc[0] != null) resolve(call, netLoc[0]);
+                else lastKnown(call, lm);
+            };
+
             if (gps) {
-                current(lm, LocationManager.GPS_PROVIDER, GPS_TIMEOUT_MS, loc -> {
-                    if (loc != null) { resolve(call, loc); return; }
-                    fallbackNetwork(call, lm, net);
+                gpsSig[0] = current(lm, LocationManager.GPS_PROVIDER, GPS_TIMEOUT_MS, loc -> {
+                    gpsDone[0] = true;
+                    if (done[0]) return;
+                    if (loc != null) {
+                        done[0] = true;
+                        if (netSig[0] != null) netSig[0].cancel();
+                        resolve(call, loc);
+                        return;
+                    }
+                    finishWithoutGood.run();
                 });
-            } else {
-                fallbackNetwork(call, lm, net);
+            }
+            if (net) {
+                netSig[0] = current(lm, LocationManager.NETWORK_PROVIDER, NET_TIMEOUT_MS, loc -> {
+                    netDone[0] = true;
+                    if (done[0]) return;
+                    if (loc != null) {
+                        netLoc[0] = loc;
+                        if (loc.hasAccuracy() && loc.getAccuracy() <= GOOD_ACCURACY_M) {
+                            done[0] = true;
+                            if (gpsSig[0] != null) gpsSig[0].cancel();
+                            Location m = recentMockLocation(lm);
+                            resolve(call, m != null ? m : loc);
+                            return;
+                        }
+                    }
+                    finishWithoutGood.run();
+                });
             }
         } catch (SecurityException e) {
             call.reject("Izin lokasi ditolak. Aktifkan izin lokasi untuk aplikasi ini di Pengaturan HP.");
         }
     }
 
-    private void fallbackNetwork(PluginCall call, LocationManager lm, boolean net) {
+    /** Lokasi bertanda mock yang masih baru (< 30 dtk) dari penyedia mana pun, atau null. */
+    private Location recentMockLocation(LocationManager lm) {
         try {
-            if (net) {
-                current(lm, LocationManager.NETWORK_PROVIDER, NET_TIMEOUT_MS, loc -> {
-                    if (loc != null) { resolve(call, loc); return; }
-                    lastKnown(call, lm);
-                });
-            } else {
-                lastKnown(call, lm);
+            for (String p : new String[]{LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER}) {
+                Location l = lm.getLastKnownLocation(p);
+                if (l == null || (System.currentTimeMillis() - l.getTime()) >= 30000) continue;
+                boolean mock = Build.VERSION.SDK_INT >= 31 ? l.isMock() : l.isFromMockProvider();
+                if (mock) return l;
             }
-        } catch (SecurityException e) {
-            call.reject("Izin lokasi ditolak. Aktifkan izin lokasi untuk aplikasi ini di Pengaturan HP.");
+        } catch (SecurityException ignored) {
+            // izin dicek terpisah oleh pemanggil
         }
+        return null;
     }
 
     /** Lokasi terakhir yang diketahui, hanya kalau masih segar (< 60 dtk). */
@@ -166,7 +219,7 @@ public class TsDevicePlugin extends Plugin {
 
     private interface LocCallback { void done(Location loc); }
 
-    private void current(LocationManager lm, String provider, long timeoutMs, LocCallback cb) {
+    private CancellationSignal current(LocationManager lm, String provider, long timeoutMs, LocCallback cb) {
         final CancellationSignal signal = new CancellationSignal();
         final Handler main = new Handler(Looper.getMainLooper());
         final boolean[] finished = {false};
@@ -180,6 +233,7 @@ public class TsDevicePlugin extends Plugin {
             main.removeCallbacks(timeout);
             cb.done(loc);
         });
+        return signal;
     }
 
     private void resolve(PluginCall call, Location loc) {
